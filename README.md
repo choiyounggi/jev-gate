@@ -7,7 +7,7 @@
 
 | 지점 | 무엇을 하나 | 어떻게 결정하나 |
 |---|---|---|
-| **Bash 게이트** (PreToolUse) | 위험 명령을 실행 전에 거른다 | 1) 하드 거부 목록 → exit 2 차단 · 2) 읽기 전용 빠른 경로 → allow, 모델 호출 없음 · 3) 모델: caution 확신 ≥ 0.8 ∧ 비가역 ≥ 0.7 → exit 2 차단, caution 확신 ≥ 0.8 → ask, clear 확신 ≥ 0.8 → allow, 그 외 결정 없음. override 마커가 있으면 모델을 건너뛴다 |
+| **Bash 게이트** (PreToolUse) | 위험 명령을 실행 전에 거른다 | 1) 하드 거부 목록 → exit 2 차단 · 2) 읽기 전용 빠른 경로 → allow, 모델 호출 없음 · 3) 모델: caution 확신 ≥ 0.8 ∧ 비가역 ≥ 0.7 → exit 2 차단, caution 확신 ≥ 0.8 → ask, clear 확신 ≥ 0.8 → allow, 그 외 결정 없음. override 마커는 사용자 허용 목록에 있는 한 줄 명령일 때만 모델을 건너뛴다 |
 | **정지 게이트** (Stop · SubagentStop) | 증거 없는 "완료" 주장을 되돌린다 | done_claimed p ≥ 0.8 ∧ evidence p ≤ 0.2 → 정지 1회 차단, 이유 반환. 미검증을 명시한 보고는 통과 |
 | **`decide` MCP 도구 + `jev-decide` 스킬** | 에이전트가 분류·순위·예/아니오 판단을 병렬로 넘긴다 | 확신 ≥ 0.8만 신뢰, 선택지 열거·설계·인가는 에이전트가 |
 
@@ -83,13 +83,56 @@ claude plugin install jev-gate@groundwork
 | `JEV_GATE_MODEL_MAXCHARS` | `3000` | 모델에 보내는 명령 길이 상한(앞 2,000자 + 뒤 800자). 로그에는 원문이 남는다 |
 | `JEV_GATE_TIMEOUT` | `6` | Bash 게이트 모델 호출 타임아웃(초) |
 | `JEV_GATE_DISABLE` / `JEV_STOP_DISABLE` | | `1`이면 해당 훅 끄기 |
+| `JEV_GATE_OVERRIDE_ALLOW` | `~/.config/jev-gate/override-allow` | 모델 계층이 override 마커를 따를 명령 패턴 파일 |
+| `JEV_GATE_CURL_ALLOW` | `~/.config/jev-gate/curl-allow` | curl 변경 호출 규칙에서 뺄 명령 전체 패턴 파일 |
 | `JEV_STOP_THRESHOLD` / `JEV_STOP_EVIDENCE_MAX` | `0.8` / `0.2` | 정지 게이트 임계값 |
 
 Claude Code `settings.json`의 `env`에 넣으면 훅이 읽는다.
 
 **override 마커**: 사용자가 대화에서 명시적으로 승인한 명령은 명령 **끝**에 `# jev-gate: override`를 붙여 재실행한다.
-하드 거부 목록에 걸리면 strict 차단이 ask로 내려가고, 모델 계층은 아예 호출하지 않는다(결정 없음 → 평소 권한 흐름). 둘 다 로그에 override가 남는다.
-headless 워커가 발행·배포처럼 모델이 caution으로 볼 명령을 돌려야 하면 그 명령에 마커를 붙여 두는 것이 정답이고, 마커 없이 문구만 바꿔 재시도하는 것은 게이트를 속이는 일이다.
+하드 거부 목록에 걸리면 strict 차단이 ask로 내려간다(allow는 되지 않는다). 로그에 override가 남는다.
+
+**모델 계층 override는 사용자가 쓴 허용 목록으로만 열린다** (0.3.1). 마커는 에이전트가 타이핑하는 것이라,
+마커만으로 모델을 끄면 트랜스크립트에 심긴 `node -e "…rmSync…"  # jev-gate: override`가 인라인 코드를 읽는 유일한 계층을 건너뛴다.
+그래서 모델 계층은 다음을 모두 만족할 때만 마커를 따른다: 명령이 한 줄, 마커를 뗀 명령이 일반 문자 집합만 담음(아래), 그 명령 **전체**가
+`~/.config/jev-gate/override-allow`(또는 `JEV_GATE_OVERRIDE_ALLOW`)의 한 줄(ERE, `^(…)$`로 고정, 빈 줄·`#` 주석 무시)과 일치.
+아니면 마커를 무시하고 평소처럼 판단하며 로그에 이유를 남긴다. 파일이 없으면 모델 계층 override는 없다.
+
+headless 워커가 발행·배포처럼 모델이 caution으로 볼 명령을 돌려야 하면, 그 명령의 **정확한 모양**을 허용 목록에 넣고 워커는 그 모양 그대로 마커를 붙인다.
+패턴은 좁게 쓴다: 경로는 설치 위치와 데이터 폴더를 문자 그대로 고정하고, 인자 자리에 `[^ ]*`·`.*`를 쓰지 않는다
+(느슨한 경로 자리에는 `node --eval=…//scripts/…`나 `--import=` 같은 옵션이 끼어든다 — 0.3.1 리뷰에서 실제로 나온 우회).
+마커를 뗀 명령은 영문자·숫자·공백과 `. / _ - @ + , : = ~ "`만 담아야 하고(탭·따옴표 `'`·괄호·`$`·`*` 등은 거부), `#` 앞에는 공백이 있어야 마커로 인정된다.
+예: auto-velog 발행 (`/Users/you`를 자기 홈으로, `0\.2\.1`을 설치된 버전으로 — 캐시에 남은 옛 버전까지 맞지 않게 버전은 와일드카드로 두지 않는다)
+
+```
+# auto-velog: 헤드리스 발행 (publish.mjs --auto가 mode·점수·초안 폴더·상한·시크릿을 코드로 확인한다)
+node "?/Users/you/\.claude/plugins/cache/auto-velog/auto-velog/0\.2\.1/scripts/adapters/velog/publish\.mjs"? "?/Users/you/\.auto-velog/drafts/[A-Za-z0-9_][A-Za-z0-9_.-]*\.md"?( "?/Users/you/\.auto-velog/drafts/[A-Za-z0-9_][A-Za-z0-9_.-]*\.png"?)? --auto
+```
+
+마커 없이 문구만 바꿔 재시도하는 것은 게이트를 속이는 일이다.
+
+**curl 허용 목록** (0.3.1): 하드 거부 목록의 curl 규칙은 원격으로 가는 변경 호출(`-X POST|PUT|DELETE|PATCH`, `-d`, `--data`)을 막는다.
+Jira 상태 전이처럼 늘 쓰는 호출은 그 **명령 전체 모양**을 `~/.config/jev-gate/curl-allow`(또는 `JEV_GATE_CURL_ALLOW`)에 한 줄씩(ERE, `^(…)$`로 고정) 적어 이 규칙에서 뺄 수 있다.
+빠진 명령도 **허용되는 것이 아니라** 평소처럼 판단 모델과 Claude Code 권한 흐름으로 간다. 명령이 다음 중 하나면 목록과 상관없이 막힌다:
+
+- 여러 줄이거나, 출력 가능한 ASCII 밖의 문자(탭·CR·한글 등)가 있다
+- `; & | < > \`·백틱·`$(`가 있다 — 두 번째 명령이나 명령 결과를 끼워 넣을 수 없다
+
+주소만 적는 방식은 쓰지 않는다: 리뷰에서 목록에 있는 주소 옆에 `evil.example`(스킴 없는 두 번째 주소)·`--url`·`--next`·`-x` 프록시·
+`--resolve`·`-sd@파일`·`-H @파일`·`--variable`을 붙여 토큰이나 파일을 다른 곳으로 보내는 우회가 18가지 나왔다. 명령 전체를 고정하면 옵션을 더할 자리가 없다.
+
+예: Jira Cloud 상태 전이. 막힌 명령은 `~/.local/state/jev-gate/decisions.jsonl`에 그대로 남아 있으니 그 줄을 복사해
+이슈 키·전이 ID처럼 바뀌는 자리만 패턴으로 바꾼다(`$`·`{`·`}`·`.`는 `\`로 이스케이프). `acme`는 자기 사이트로, Server/DC면 호스트와 `/rest/api/2/`로.
+
+```
+# Jira 상태 전이: 사이트·인증·헤더·본문 고정, 이슈 키와 전이 ID만 바뀐다 (-q: ~/.curlrc 무시)
+curl -q -s -X POST -u "\$JIRA_EMAIL:\$JIRA_API_TOKEN" -H "Content-Type: application/json" "https://acme\.atlassian\.net/rest/api/3/issue/[A-Z][A-Z0-9_]+-[0-9]+/transitions" -d '\{"transition":\{"id":"[0-9]+"\}\}'
+```
+
+줄에는 모든 옵션을 문자 그대로 고정하고 맨 앞에 `-q`를 둔다(curl이 `~/.curlrc`를 읽지 않게). 에이전트가 쓰는 명령에도 `-q`를 붙여야 일치한다.
+`curl .*` 같은 느슨한 줄은 `--url evil.example` 같은 옵션을 통과시키므로 규칙을 끄는 것과 같다.
+남는 위험: `https_proxy`·`CURL_CA_BUNDLE` 같은 환경 변수는 `-q`로도 막히지 않는다(세션이 뜨는 환경의 문제). 기존 localhost 예외는 `https?://` 주소만 보므로,
+`http://localhost:…/` 옆에 스킴 없는 두 번째 주소를 붙인 curl도 이 규칙에서는 빠진다(모델 판단은 거친다).
 
 **알려진 마찰**: 하드 거부 목록은 명령 *텍스트* 전체를 보므로 heredoc으로 파일에 쓰는 산문에 `git push --force` 같은 문구가 있어도 차단된다(하루 1,023건 중 3건).
 차단 메시지가 그 경우를 안내하며, 그런 글은 Write/Edit 도구로 쓴다. 본문을 스캔에서 빼는 기능은 우회가 계속 나와 철회했다(`hooks/NOTES.md`).

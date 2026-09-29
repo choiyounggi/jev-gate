@@ -6,7 +6,7 @@
 #        - hard denylist        -> ask (or block with exit 2 when JEV_GATE_STRICT=1); scans the whole text
 #        - read-only fast path  -> allow, no model call
 #   2. Jev/ollaya judgment (winnow:e4b by default) with typed questions
-#        - override marker present                                                -> no decision, model skipped
+#        - override marker on a user-allowlisted one-line command                 -> no decision, model skipped
 #        - clear   with confidence >= JEV_GATE_THRESHOLD and low destructive prob -> allow
 #        - caution with confidence >= JEV_GATE_THRESHOLD
 #              and destructive >= JEV_GATE_BLOCK_DESTRUCTIVE                      -> block (exit 2) in strict mode
@@ -22,7 +22,7 @@
 # so thresholds can be re-tuned against real traffic later.
 #
 # Env: JEV_GATE_DISABLE=1  JEV_GATE_URL  JEV_GATE_MODEL  JEV_GATE_THRESHOLD  JEV_GATE_BLOCK_DESTRUCTIVE
-#      JEV_GATE_MODEL_MAXCHARS  JEV_GATE_TIMEOUT  JEV_GATE_STRICT  JEV_GATE_LOG
+#      JEV_GATE_MODEL_MAXCHARS  JEV_GATE_TIMEOUT  JEV_GATE_STRICT  JEV_GATE_LOG  JEV_GATE_OVERRIDE_ALLOW  JEV_GATE_CURL_ALLOW
 
 set -u
 
@@ -81,11 +81,13 @@ DENY_PATTERNS=(
 # A command ending in the override marker was explicitly approved by the user in conversation:
 # strict mode then asks instead of blocking, and the override is logged.
 OVERRIDE=0
-printf '%s' "$CMD" | tail -n 1 | grep -Eq -- '#[[:space:]]*jev-gate:[[:space:]]*override[[:space:]]*$' && OVERRIDE=1
+# The shell starts a comment only after whitespace: `--auto#jev-gate: override` is an argument, not a marker.
+printf '%s' "$CMD" | tail -n 1 | grep -Eq -- '(^|[[:space:]])#[[:space:]]*jev-gate:[[:space:]]*override[[:space:]]*$' && OVERRIDE=1
 # The curl/wget rule is about outward network effects: skip it when every URL in the command is local.
 LOCAL_ONLY=0
 urls=$(printf '%s' "$CMD" | grep -oE 'https?://[^[:space:]"'"'"'<>]+' || true)
-if [ -n "$urls" ] && ! printf '%s\n' "$urls" | grep -Eqv '^https?://(localhost|127\.0\.0\.1|\[::1\])([:/]|$)'; then
+# host, optional port, then / or the end: `http://localhost:80@evil.example/` is userinfo, not localhost.
+if [ -n "$urls" ] && ! printf '%s\n' "$urls" | grep -Eqv '^https?://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$)'; then
   LOCAL_ONLY=1
 fi
 # The denylist scans the whole command text, heredoc bodies included. Prose in a heredoc that mentions
@@ -94,8 +96,28 @@ fi
 # shell quoting (see hooks/NOTES.md). The block message points at the Write tool instead.
 HEREDOC_HINT=""
 printf '%s' "$CMD" | grep -q '<<' && HEREDOC_HINT=" If the match is only prose inside a heredoc, write that file with the Write tool instead of a shell command."
+# A user may also list whole commands the curl rule should not hard-block (e.g. a Jira status
+# transition) in ~/.config/jev-gate/curl-allow (or JEV_GATE_CURL_ALLOW): one ERE per line, matched
+# against the ENTIRE command (anchored ^(...)$; blank lines and # comments skipped; an invalid pattern
+# never matches). Matching single URLs was tried and broke in review: scheme-less second hosts, --url,
+# --next, -x, --resolve, -sd@file, -H @file and --variable all rode along with a listed URL. So the
+# command must also be one line of printable ASCII (no tab/CR) without ; & | < > \ backtick or $( , and
+# the user's line pins every option. A lifted command is NOT allowed by this: it continues to the
+# model layer and the normal permission flow.
+CURL_ALLOW_FILE="${JEV_GATE_CURL_ALLOW:-${XDG_CONFIG_HOME:-$HOME/.config}/jev-gate/curl-allow}"
+REMOTE_LISTED=0
+# shellcheck disable=SC2016  # literal $( and backtick are what the pattern looks for
+if [ "$LOCAL_ONLY" = "0" ] && [ -r "$CURL_ALLOW_FILE" ] \
+   && [ "$(printf '%s\n' "$CMD" | wc -l | tr -d ' ')" = "1" ] \
+   && ! printf '%s' "$CMD" | LC_ALL=C grep -q '[^ -~]' \
+   && ! printf '%s' "$CMD" | grep -q '[;&|<>`\\]\|\$('; then
+  while IFS= read -r upat || [ -n "$upat" ]; do
+    case $upat in ''|'#'*) continue ;; esac
+    if printf '%s\n' "$CMD" | grep -Eqx -- "$upat" 2>/dev/null; then REMOTE_LISTED=1; break; fi
+  done < "$CURL_ALLOW_FILE"
+fi
 for pat in "${DENY_PATTERNS[@]}"; do
-  case $pat in curl*) [ "$LOCAL_ONLY" = "1" ] && continue ;; esac
+  case $pat in curl*) { [ "$LOCAL_ONLY" = "1" ] || [ "$REMOTE_LISTED" = "1" ]; } && continue ;; esac
   if printf '%s' "$CMD" | grep -Eq -- "$pat"; then
     reason="deterministic rule matched: $pat"
     if [ "$STRICT" = "1" ] && [ "$OVERRIDE" != "1" ]; then
@@ -151,11 +173,34 @@ if ! printf '%s' "$CMD" | grep -Eq -- "$ESCAPE_TOKENS"; then
 fi
 
 # ---- layer 2: Jev / ollaya judgment ------------------------------------------------------------
-# The user already approved this exact command in conversation: the model's opinion would only be
-# ignored (interactive bypass) or turned into a denial (headless). Log it and take no decision.
+# The marker is typed by the agent, so on its own it cannot switch the model off: an injected
+# `node -e "…rmSync…"  # jev-gate: override` would otherwise skip the only layer that reads inline
+# code. The model layer honours the marker only for a command the USER allowlisted: one line, no
+# shell metacharacters, and the whole command (marker removed) matching a line of the allowlist file
+# (ERE, anchored here as ^(…)$; blank lines and # comments ignored). Anything else is judged as usual.
+ALLOW_FILE="${JEV_GATE_OVERRIDE_ALLOW:-${XDG_CONFIG_HOME:-$HOME/.config}/jev-gate/override-allow}"
 if [ "$OVERRIDE" = "1" ]; then
-  log_decision jev none "override marker present: model layer skipped (user-approved in conversation)" ""
-  exit 0
+  bare=$(printf '%s' "$CMD" | sed -E 's/[[:space:]]+#[[:space:]]*jev-gate:[[:space:]]*override[[:space:]]*$//')
+  why=""
+  # A whitelist, not a blacklist: plain ASCII words, spaces (not tabs), and . / _ - @ + , : = ~ ".
+  # Quotes, parentheses, $, backticks, ; & | < > \ * ? [ { and every non-ASCII byte are refused,
+  # so an allowlist pattern can never be satisfied by smuggled code such as --eval=require('fs')...
+  if [ "$(printf '%s\n' "$CMD" | wc -l | tr -d ' ')" != "1" ]; then why="multi-line command"
+  elif printf '%s' "$bare" | LC_ALL=C grep -q '[^A-Za-z0-9_ ./@+,:=~"-]'; then why="characters outside the plain set"
+  elif [ ! -r "$ALLOW_FILE" ]; then why="no allowlist at $ALLOW_FILE"
+  else
+    why="not in $ALLOW_FILE"
+    while IFS= read -r pat || [ -n "$pat" ]; do
+      case $pat in ''|'#'*) continue ;; esac
+      # grep exits 2 on an invalid pattern: that counts as no match (fail safe), never as a match.
+      if printf '%s\n' "$bare" | grep -Eqx -- "$pat" 2>/dev/null; then why=""; break; fi
+    done < "$ALLOW_FILE"
+  fi
+  if [ -z "$why" ]; then
+    log_decision jev none "override marker on an allowlisted command: model layer skipped" ""
+    exit 0
+  fi
+  log_decision jev none "override marker not honoured by the model layer ($why): judging as usual" ""
 fi
 # The model input is capped so a long script cannot push the call past the timeout (which would mean
 # no judgment at all). The head and tail carry the verbs; the log keeps the whole command.
