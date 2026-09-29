@@ -106,3 +106,42 @@ def test_subagent_stop_uses_same_logic(tmp_path):
     assert rc == 0 and out is not None and out["decision"] == "block"
     logged = json.loads((tmp_path / "stop-test.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert logged["event"] == "SubagentStop"
+
+
+# ---- model layer against a fake TypeSafe-compatible server (no ollaya needed) -------------------
+
+def _env(fake_server, tmp_path, status, conf, evidence, model_file=None):
+    fake_server.answers = {"status": {"type": "choice", "choice": status, "confidence": conf, "probabilities": {}},
+                           "has_evidence": {"type": "noul", "noul": evidence}}
+    env = {"JEV_GATE_URL": fake_server.url, "JEV_STOP_TIMEOUT": "3", "XDG_CONFIG_HOME": str(tmp_path / "cfg"), "JEV_GATE_MODEL": ""}
+    if model_file:
+        (tmp_path / "cfg" / "jev-gate").mkdir(parents=True)
+        (tmp_path / "cfg" / "jev-gate" / "model").write_text(model_file + "\n")
+    return env
+
+
+def test_fake_done_without_evidence_blocks_and_uses_configured_model(fake_server, tmp_path):
+    rc, out = run_hook(stop("완료했습니다."), _env(fake_server, tmp_path, "done_claimed", 0.95, 0.05, model_file="decider:0.8b"), tmp_path)
+    assert rc == 0 and out["decision"] == "block"
+    assert fake_server.requests[-1]["model"] == "decider:0.8b"
+    assert fake_server.requests[-1]["state"]["message"] == "완료했습니다."
+
+
+@pytest.mark.parametrize("status,conf,evidence", [
+    ("done_claimed", 0.95, 0.9),        # evidenced
+    ("done_claimed", 0.7, 0.05),        # not confident it is a claim
+    ("progress_only", 0.95, 0.05),
+    ("blocked_or_question", 0.95, 0.05),
+    ("failure_reported", 0.95, 0.05),
+])
+def test_fake_non_blocking_matrix(fake_server, tmp_path, status, conf, evidence):
+    rc, out = run_hook(stop("어떤 메시지"), _env(fake_server, tmp_path, status, conf, evidence), tmp_path)
+    assert rc == 0 and out is None
+
+
+def test_fake_long_message_sends_only_the_tail(fake_server, tmp_path):
+    env = _env(fake_server, tmp_path, "progress_only", 0.9, 0.1)
+    env["JEV_STOP_MAXCHARS"] = "50"
+    run_hook(stop("A" * 200 + "END"), env, tmp_path)
+    sent = fake_server.requests[-1]["state"]["message"]
+    assert len(sent.encode()) <= 50 and sent.endswith("END")

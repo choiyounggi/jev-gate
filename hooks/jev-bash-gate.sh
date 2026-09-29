@@ -22,7 +22,7 @@ set -u
 command -v jq >/dev/null 2>&1 || exit 0          # cannot parse input; never block on tooling gaps
 
 URL="${JEV_GATE_URL:-http://localhost:11435/v1/systemone}"
-MODEL="${JEV_GATE_MODEL:-winnow:e4b}"
+MODEL="${JEV_GATE_MODEL:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/jev-gate/model" 2>/dev/null || echo winnow:e4b)}"
 THRESHOLD="${JEV_GATE_THRESHOLD:-0.8}"
 TIMEOUT="${JEV_GATE_TIMEOUT:-4}"
 STRICT="${JEV_GATE_STRICT:-0}"

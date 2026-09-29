@@ -21,11 +21,24 @@ claude plugin marketplace add choiyounggi/groundwork
 claude plugin install jev-gate@groundwork
 ```
 
-그다음 새 세션에서 `/jev-gate:setup`을 실행하면 ollaya를 `~/.local`에 설치하고 winnow:e4b(8 GB)를 받아
-LaunchAgent로 상주시킨 뒤 판단 한 건으로 동작을 확인한다. 직접 하려면 `bash scripts/setup-ollaya.sh`.
+### 첫 온보딩: 기계에 맞는 모델 고르기
 
-요구 사항: macOS Apple silicon 또는 Linux, `jq`, `curl`. 모델이 메모리에 올라가면 wired 약 8 GB를 쓰고 1시간 유휴 후 내려간다.
-16 GB 이하 기계는 `JEV_GATE_MODEL=kev:0.8b`를 고려할 것(정확도 미측정).
+설치 직후 첫 세션이 시작되면 SessionStart 훅이 모델 계층이 비어 있음을 알리고 **이 기계에 맞는 모델**을 추천한다.
+그 상태에서도 훅 두 개는 결정론 규칙만으로 동작하며 아무것도 막지 않는다. `/jev-gate:setup`을 실행하면 추천을 첫 옵션으로
+선택지를 묻고, ollaya를 `~/.local`에 설치하고 모델을 받아 상주시킨 뒤 판단 한 건으로 검증한다. 선택은 `~/.config/jev-gate/model`에
+기록되어 훅 두 개와 `decide` 도구가 같은 모델을 쓴다.
+
+| 기계 (`scripts/recommend-model.sh`가 감지) | 추천 모델 | 다운로드 | 정확도 근거 |
+|---|---|---|---|
+| NVIDIA VRAM ≥ 12 GB 또는 메모리 ≥ 24 GB | `winnow:e4b` (Gemma-4 7.5B Q8) | ~8 GB | jev-gate 측정: 셸 위험도 84%(위험 명령 놓침 0건), 보고 분류 100% |
+| 메모리 16–23 GB | `decider` (Qwen3.5 2.2B) | ~4 GB | 작성자 보고 typed-decisions 0.680, jev-gate 미측정 |
+| 메모리 8–15 GB | `decider:0.8b` | ~1.5 GB | 미측정 |
+| 메모리 < 8 GB | `laya` (인코더, ~100 ms) | ~1.5 GB | 셸 위험 판단 약함(36~68%) → 규칙 계층에 의존 |
+
+로드 중 메모리 점유는 다운로드 크기와 거의 같고, 1시간 유휴 후 자동 해제된다. 언제든 `JEV_GATE_MODEL=<이름> bash scripts/setup-ollaya.sh`로 바꿀 수 있고,
+작은 모델을 골랐다면 `eval/eval.py --model <이름>`으로 먼저 재 보고 `JEV_GATE_THRESHOLD`를 0.85로 올리는 것을 권한다.
+
+요구 사항: macOS Apple silicon 또는 Linux(glibc ≥ 2.38), `jq`, `curl`.
 
 ## 왜 이 설계인가 (측정 근거)
 

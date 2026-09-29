@@ -167,3 +167,60 @@ def test_model_layer_does_not_ask_for_a_plain_build(tmp_path):
     rc, decision, _ = run_hook(bash("cargo build --release", "릴리스 빌드"), None, tmp_path)
     assert rc == 0
     assert decision != "ask"
+
+
+# ---- model layer against a fake TypeSafe-compatible server (no ollaya needed) -------------------
+
+def _model_env(fake_server, tmp_path, answers, model_file=None, extra=None):
+    fake_server.answers = answers
+    env = {"JEV_GATE_URL": fake_server.url, "JEV_GATE_TIMEOUT": "3", "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+    env["JEV_GATE_MODEL"] = ""  # make sure the real user's env does not leak in
+    if model_file is not None:
+        (tmp_path / "cfg" / "jev-gate").mkdir(parents=True)
+        (tmp_path / "cfg" / "jev-gate" / "model").write_text(model_file + "\n")
+    env.update(extra or {})
+    return env
+
+
+def test_model_layer_uses_configured_model_file(fake_server, tmp_path):
+    env = _model_env(fake_server, tmp_path, {"risk": {"type": "choice", "choice": "clear", "confidence": 0.5, "probabilities": {}},
+                                             "destructive": {"type": "noul", "noul": 0.1}}, model_file="decider")
+    run_hook(bash("cargo build --release"), env, tmp_path)
+    assert fake_server.requests[-1]["model"] == "decider"
+
+
+def test_model_layer_env_overrides_model_file(fake_server, tmp_path):
+    env = _model_env(fake_server, tmp_path, {"risk": {"type": "choice", "choice": "clear", "confidence": 0.5, "probabilities": {}},
+                                             "destructive": {"type": "noul", "noul": 0.1}}, model_file="decider",
+                     extra={"JEV_GATE_MODEL": "winnow:e4b"})
+    run_hook(bash("cargo build --release"), env, tmp_path)
+    assert fake_server.requests[-1]["model"] == "winnow:e4b"
+
+
+def test_model_layer_defaults_to_winnow_without_config(fake_server, tmp_path):
+    env = _model_env(fake_server, tmp_path, {"risk": {"type": "choice", "choice": "clear", "confidence": 0.5, "probabilities": {}},
+                                             "destructive": {"type": "noul", "noul": 0.1}})
+    run_hook(bash("cargo build --release"), env, tmp_path)
+    assert fake_server.requests[-1]["model"] == "winnow:e4b"
+    assert fake_server.requests[-1]["state"]["command"] == "cargo build --release"
+
+
+@pytest.mark.parametrize("choice,conf,destr,expected", [
+    ("clear", 0.95, 0.05, "allow"),
+    ("clear", 0.95, 0.5, None),      # confident clear but destructive not low -> no decision
+    ("clear", 0.6, 0.05, None),
+    ("caution", 0.9, 0.7, "ask"),
+    ("caution", 0.6, 0.7, None),
+])
+def test_model_layer_decision_matrix(fake_server, tmp_path, choice, conf, destr, expected):
+    env = _model_env(fake_server, tmp_path, {"risk": {"type": "choice", "choice": choice, "confidence": conf, "probabilities": {}},
+                                             "destructive": {"type": "noul", "noul": destr}})
+    rc, decision, _ = run_hook(bash("cargo build --release"), env, tmp_path)
+    assert rc == 0 and decision == expected
+
+
+def test_model_layer_server_error_yields_no_decision(fake_server, tmp_path):
+    env = _model_env(fake_server, tmp_path, {})
+    fake_server.status = 500
+    rc, decision, out = run_hook(bash("cargo build --release"), env, tmp_path)
+    assert rc == 0 and decision is None and out == ""

@@ -22,7 +22,7 @@ description: 이 맥의 로컬 판단 모델(ollaya, winnow:e4b)로 분류·순�
 
 ## 어떻게 부르나
 
-1. **MCP 도구 `decide`(서버 `ollaya`)**: `state`(문자열 또는 JSON), `questions`, `model: "winnow:e4b"`.
+1. **MCP 도구 `decide`(서버 `ollaya`)**: `state`(문자열 또는 JSON), `questions`, `model`은 `~/.config/jev-gate/model`에 적힌 값(setup이 기계 사양에 맞춰 고른 모델). 파일이 없으면 `winnow:e4b`.
 2. MCP가 없으면 HTTP:
    ```sh
    curl -s http://127.0.0.1:11435/v1/systemone -H 'Content-Type: application/json' \
@@ -32,7 +32,7 @@ description: 이 맥의 로컬 판단 모델(ollaya, winnow:e4b)로 분류·순�
 
 ## 이 맥에서 측정된 것 (2026-09-28, 한국어 50건)
 
-- `winnow:e4b`: 에이전트 보고 분류 100%, 증거 유무 92%, 셸 위험도 84%(위험 명령 놓침 0건). **`laya`는 이 용도에 부적합**(36~68%)이므로 기본 모델은 항상 `winnow:e4b`.
+- `winnow:e4b`(24 GB 이상 기계의 기본): 에이전트 보고 분류 100%, 증거 유무 92%, 셸 위험도 84%(위험 명령 놓침 0건). `laya`는 이 용도에 약하다(36~68%). 메모리가 적은 기계에서 setup이 고른 `decider`/`decider:0.8b`는 **아직 측정되지 않았으니** 확신 임계값을 더 보수적으로(0.85) 두고, `eval/eval.py --model <이름>`으로 먼저 재 보는 것이 좋다.
 - 모델은 **부정·위험 쪽에만 확신**한다. 확신 0.8 이상은 그대로 믿고, 0.8 미만은 스스로 판단하거나 사용자에게 넘긴다.
 - 긴 state에 무관한 내용이 섞이면 정확도가 떨어진다. 판단에 필요한 필드만 넣는다.
 

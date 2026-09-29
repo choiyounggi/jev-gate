@@ -1,19 +1,29 @@
 #!/bin/bash
 # Idempotent setup for jev-gate's model layer on macOS (Apple silicon) or Linux:
 #   1. install ollaya into ~/.local (official installer, sha256-verified) if missing
-#   2. pull the default model (winnow:e4b, ~8 GB) if missing
+#   2. pull the chosen model if missing (JEV_GATE_MODEL > ~/.config/jev-gate/model > recommend-model.sh)
 #   3. keep a server running: macOS LaunchAgent (KEEP_ALIVE 1h) unless something already serves :11435
 #   4. warm the model once and print a probe decision
-# Env: JEV_GATE_MODEL (default winnow:e4b), OLLAYA_KEEP_ALIVE (default 1h), JEV_SETUP_NO_SERVICE=1
+# Env: JEV_GATE_MODEL (default: ~/.config/jev-gate/model, else scripts/recommend-model.sh), OLLAYA_KEEP_ALIVE (default 1h), JEV_SETUP_NO_SERVICE=1
 set -eu
 
-MODEL="${JEV_GATE_MODEL:-winnow:e4b}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/jev-gate"
+if [ -n "${JEV_GATE_MODEL:-}" ]; then
+  MODEL="$JEV_GATE_MODEL"; WHY="chosen via JEV_GATE_MODEL"
+elif [ -s "$CFG_DIR/model" ]; then
+  MODEL="$(cat "$CFG_DIR/model")"; WHY="previously configured in $CFG_DIR/model"
+else
+  REC="$(bash "$HERE/recommend-model.sh" --json)"
+  MODEL="$(printf '%s' "$REC" | jq -r .model)"; WHY="recommended for this machine: $(printf '%s' "$REC" | jq -r .reason)"
+fi
 KEEP="${OLLAYA_KEEP_ALIVE:-1h}"
 PORT=11435
 BIN="$HOME/.local/bin/ollaya"
 LABEL="com.jev-gate.ollaya"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 status() { printf '>>> %s\n' "$*" >&2; }
+status "model: $MODEL ($WHY)"
 
 # 1. binary
 if [ -x "$BIN" ] || command -v ollaya >/dev/null 2>&1; then
@@ -27,7 +37,8 @@ else
   rm -rf "$TMP"
   [ -x "$BIN" ] || { echo "install failed: $BIN missing" >&2; exit 1; }
 fi
-export PATH="$(dirname "$BIN"):$PATH"
+BIN_DIR="$(dirname "$BIN")"
+export PATH="$BIN_DIR:$PATH"
 
 # 2. service
 serving() { curl -sf --max-time 1 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; }
@@ -70,9 +81,12 @@ fi
 if "$BIN" list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
   status "model present: $MODEL"
 else
-  status "pulling $MODEL (winnow:e4b is ~8 GB)"
+  status "pulling $MODEL (download size is shown by ollaya; winnow:e4b ≈ 8 GB, decider ≈ 4 GB, decider:0.8b/laya ≈ 1.5 GB)"
   "$BIN" pull "$MODEL"
 fi
+
+# 3b. remember the choice so the hooks and the MCP skill use the same model
+mkdir -p "$CFG_DIR" && printf '%s\n' "$MODEL" >"$CFG_DIR/model" && status "wrote $CFG_DIR/model"
 
 # 4. warm + probe
 status "warming $MODEL (first load reads the weights from disk: up to ~20 s)"

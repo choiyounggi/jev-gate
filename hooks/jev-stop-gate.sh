@@ -17,7 +17,7 @@ set -u
 command -v jq >/dev/null 2>&1 || exit 0
 
 URL="${JEV_GATE_URL:-http://localhost:11435/v1/systemone}"
-MODEL="${JEV_GATE_MODEL:-winnow:e4b}"
+MODEL="${JEV_GATE_MODEL:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/jev-gate/model" 2>/dev/null || echo winnow:e4b)}"
 THRESHOLD="${JEV_STOP_THRESHOLD:-0.8}"
 EVIDENCE_MAX="${JEV_STOP_EVIDENCE_MAX:-0.2}"
 TIMEOUT="${JEV_STOP_TIMEOUT:-6}"
@@ -72,7 +72,7 @@ MODEL_JSON=$(jq -cn --arg s "$STATUS" --argjson p "$CONF" --argjson e "$EVID" --
 should_block=$(jq -n --arg s "$STATUS" --argjson p "$CONF" --argjson e "$EVID" --argjson t "$THRESHOLD" --argjson em "$EVIDENCE_MAX" \
   '$s == "done_claimed" and $p >= $t and $e <= $em')
 if [ "$should_block" = "true" ]; then
-  reason=$(printf 'jev-stop-gate(%s): 완료를 주장하지만 검증 증거가 없습니다 (done p=%.2f, evidence p=%.2f). 실제로 실행한 검증의 출력을 인용해 다시 보고하세요: 테스트 개수와 실패 수, exit code, diff나 명령 출력, 커밋 해시. 검증하지 않았다면 "검증하지 않았다"고 명시하고 무엇을 확인하지 못했는지 적으세요. 다른 사람이나 워커의 보고를 그대로 전달한 경우도 미검증입니다.' "$CONF" "$EVID")
+  reason=$(printf 'jev-stop-gate(%s): 완료를 주장하지만 검증 증거가 없습니다 (done p=%.2f, evidence p=%.2f). 실제로 실행한 검증의 출력을 인용해 다시 보고하세요: 테스트 개수와 실패 수, exit code, diff나 명령 출력, 커밋 해시. 검증하지 않았다면 "검증하지 않았다"고 명시하고 무엇을 확인하지 못했는지 적으세요. 다른 사람이나 워커의 보고를 그대로 전달한 경우도 미검증입니다.' "$MODEL" "$CONF" "$EVID")
   log_decision block "$reason" "$MODEL_JSON"
   jq -cn --arg r "$reason" '{decision:"block", reason:$r, systemMessage:"jev-stop-gate: 증거 없는 완료 주장으로 정지를 한 번 막았습니다"}'
   exit 0
