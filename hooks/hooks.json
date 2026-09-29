@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/preflight.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "JEV_GATE_STRICT=\"${JEV_GATE_STRICT:-1}\" bash ${CLAUDE_PLUGIN_ROOT}/hooks/jev-bash-gate.sh",
+            "timeout": 10,
+            "statusMessage": "jev gate"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/jev-stop-gate.sh",
+            "timeout": 15,
+            "statusMessage": "jev stop gate"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/jev-stop-gate.sh",
+            "timeout": 15,
+            "statusMessage": "jev stop gate"
+          }
+        ]
+      }
+    ]
+  }
+}

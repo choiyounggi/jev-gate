@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ollaya": {
+      "type": "stdio",
+      "command": "bash",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/ollaya-mcp-launch.sh"]
+    }
+  }
+}
