@@ -7,7 +7,7 @@
 
 | 지점 | 무엇을 하나 | 어떻게 결정하나 |
 |---|---|---|
-| **Bash 게이트** (PreToolUse) | 위험 명령을 실행 전에 거른다 | 1) 하드 거부 목록 → exit 2 차단 · 2) 읽기 전용 빠른 경로 → allow, 모델 호출 없음 · 3) 모델: caution 확신 ≥ 0.8 → ask, clear 확신 ≥ 0.8 → allow, 그 외 결정 없음 |
+| **Bash 게이트** (PreToolUse) | 위험 명령을 실행 전에 거른다 | 1) 하드 거부 목록 → exit 2 차단 · 2) 읽기 전용 빠른 경로 → allow, 모델 호출 없음 · 3) 모델: caution 확신 ≥ 0.8 ∧ 비가역 ≥ 0.7 → exit 2 차단, caution 확신 ≥ 0.8 → ask, clear 확신 ≥ 0.8 → allow, 그 외 결정 없음. override 마커가 있으면 모델을 건너뛴다 |
 | **정지 게이트** (Stop · SubagentStop) | 증거 없는 "완료" 주장을 되돌린다 | done_claimed p ≥ 0.8 ∧ evidence p ≤ 0.2 → 정지 1회 차단, 이유 반환. 미검증을 명시한 보고는 통과 |
 | **`decide` MCP 도구 + `jev-decide` 스킬** | 에이전트가 분류·순위·예/아니오 판단을 병렬로 넘긴다 | 확신 ≥ 0.8만 신뢰, 선택지 열거·설계·인가는 에이전트가 |
 
@@ -58,6 +58,19 @@ claude plugin install jev-gate@groundwork
 
 자세한 기록: `hooks/NOTES.md`, 결과 파일: `eval/results/`.
 
+### 현장 하루치로 바꾼 것 (2026-09-29, 0.3.0)
+
+첫날 로그 1,023건(Bash) + 344건(정지)을 세션 기록과 대조해 보니 평가 숫자와 다른 사실 네 가지가 나왔다. 각각이 0.3.0의 변경 하나에 대응한다.
+
+| 관찰 (실측) | 변경 |
+|---|---|
+| bypassPermissions에서 모델의 `ask`는 대화형이면 그냥 실행되고(41/41), headless면 거부된다(17/17, 전부 사용자가 원한 발행) | 모델 계층에도 exit 2 경로와 override 경로를 둔다: caution ≥ 0.8 ∧ 비가역 ≥ 0.7이면 strict 차단(하루 로그에서 2건: `git reset -q --hard`, `git branch -D` 루프), `# jev-gate: override`가 있으면 모델을 건너뛴다 |
+| `git reset -q --hard origin/main`이 `-q` 때문에 하드 목록을 통과했다 | reset·clean·checkout 정규식이 동사와 옵션 사이의 짧은 플래그를 허용한다 |
+| 차단 10건 중 3건이 heredoc으로 파일에 쓰는 산문(`DROP TABLE`, `kubectl delete`, SVG 속 `rm -rf`) | heredoc 본문을 스캔에서 빼는 기능을 만들었다가 **철회**했다: 독립 리뷰의 적대적 검토 3라운드에서 정규식 기반 셸 읽기의 우회가 18개 나왔다(`hooks/NOTES.md`). 대신 차단 메시지가 "산문이면 Write 도구로 쓰라"고 안내하고, 그 우회 입력들은 회귀 테스트로 남겼다 |
+| 13,000자 명령은 모델이 5 s, 동시 4요청 × 3.7k자는 요청당 3.5~4.3 s → 타임아웃 4 s에 44건(4.3%)이 판단 없이 통과 | 모델 입력을 3,000자로 자르고(앞 2,000 + 뒤 800, 로그는 원문) 타임아웃 기본을 6 s로. 재측정: 하루 최장 10건이 0.9~2.4 s |
+
+정확도 쪽은 예측대로였다: clear 확신 최대 0.77이라 모델 allow 0건, 정지 게이트 차단 3/344건은 전부 기준 충족이고 그중 2건은 에이전트가 실제 출력을 인용하게 만들었다.
+
 ## 설정 (환경 변수)
 
 | 변수 | 기본 | 뜻 |
@@ -66,17 +79,21 @@ claude plugin install jev-gate@groundwork
 | `JEV_GATE_MODEL` | `winnow:e4b` | 두 훅과 setup이 쓰는 모델 |
 | `JEV_GATE_URL` | `http://localhost:11435/v1/systemone` | TypeSafe 호환 엔드포인트. 호스팅 Jev로 바꿀 수 있다 |
 | `JEV_GATE_THRESHOLD` | `0.8` | Bash 게이트 모델 확신 임계값 |
-| `JEV_GATE_TIMEOUT` | `4` | Bash 게이트 모델 호출 타임아웃(초) |
+| `JEV_GATE_BLOCK_DESTRUCTIVE` | `0.7` | caution 확신 ≥ 임계값이면서 비가역 확률이 이 값 이상이면 strict 모드에서 exit 2 차단 |
+| `JEV_GATE_MODEL_MAXCHARS` | `3000` | 모델에 보내는 명령 길이 상한(앞 2,000자 + 뒤 800자). 로그에는 원문이 남는다 |
+| `JEV_GATE_TIMEOUT` | `6` | Bash 게이트 모델 호출 타임아웃(초) |
 | `JEV_GATE_DISABLE` / `JEV_STOP_DISABLE` | | `1`이면 해당 훅 끄기 |
 | `JEV_STOP_THRESHOLD` / `JEV_STOP_EVIDENCE_MAX` | `0.8` / `0.2` | 정지 게이트 임계값 |
 
 Claude Code `settings.json`의 `env`에 넣으면 훅이 읽는다.
 
-**override 마커**: 사용자가 대화에서 명시적으로 승인한 명령이 하드 거부 목록에 걸리면, 명령 **끝**에 `# jev-gate: override`를 붙여 재실행한다.
-strict 차단이 ask로 내려가고 로그에 override가 남는다.
+**override 마커**: 사용자가 대화에서 명시적으로 승인한 명령은 명령 **끝**에 `# jev-gate: override`를 붙여 재실행한다.
+하드 거부 목록에 걸리면 strict 차단이 ask로 내려가고, 모델 계층은 아예 호출하지 않는다(결정 없음 → 평소 권한 흐름). 둘 다 로그에 override가 남는다.
+headless 워커가 발행·배포처럼 모델이 caution으로 볼 명령을 돌려야 하면 그 명령에 마커를 붙여 두는 것이 정답이고, 마커 없이 문구만 바꿔 재시도하는 것은 게이트를 속이는 일이다.
 
-**알려진 마찰**: 하드 거부 목록은 명령 *텍스트*를 보므로 heredoc으로 파일에 쓰는 산문에 `git push --force` 같은 문구가 있어도 차단된다.
-그런 글은 Write/Edit 도구로 쓴다. `npm publish`는 사용자 allowlist에 흔해 하드 목록에 없고 모델 계층으로 간다.
+**알려진 마찰**: 하드 거부 목록은 명령 *텍스트* 전체를 보므로 heredoc으로 파일에 쓰는 산문에 `git push --force` 같은 문구가 있어도 차단된다(하루 1,023건 중 3건).
+차단 메시지가 그 경우를 안내하며, 그런 글은 Write/Edit 도구로 쓴다. 본문을 스캔에서 빼는 기능은 우회가 계속 나와 철회했다(`hooks/NOTES.md`).
+`npm publish`는 사용자 allowlist에 흔해 하드 목록에 없고 모델 계층으로 간다.
 
 ## 레포 구조
 

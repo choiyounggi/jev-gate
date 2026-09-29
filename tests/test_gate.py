@@ -224,3 +224,206 @@ def test_model_layer_server_error_yields_no_decision(fake_server, tmp_path):
     fake_server.status = 500
     rc, decision, out = run_hook(bash("cargo build --release"), env, tmp_path)
     assert rc == 0 and decision is None and out == ""
+
+
+# ---- wiring fixes from the 2026-09-29 field data (1,023 logged decisions) ------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "git fetch -q origin && git reset -q --hard origin/main",   # slipped the list on 2026-09-29
+    "git clean -q -fdx",
+    "git checkout -q -- .github/workflows/test.yml",
+])
+def test_denylist_matches_git_verbs_with_flags_before_the_dangerous_option(cmd, tmp_path):
+    rc, decision, _ = run_hook(bash(cmd), {"JEV_GATE_URL": "http://localhost:1/x"}, tmp_path)
+    assert rc == 0 and decision == "ask", cmd
+
+
+PROSE = "## Task 19\nevery spec runs DROP TABLE users; rm -rf build/ is fine; kubectl delete pod x\n"
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat > plan.md <<'EOF'\n" + PROSE + "EOF",
+    "cd /repo\ncat >> notes.md << 'PIECEA10_EOF'\n" + PROSE + "PIECEA10_EOF\ngit status",
+    "cat <<EOF > docs/x.md\n" + PROSE + "EOF",
+    "git commit -q -F - <<'EOF'\n" + PROSE + "EOF",
+    "cat > docs/diagram.svg <<-\"SVG\"\n\t<text>rm -rf / never</text>\n\tSVG",
+    "python3 - <<'PY'\nprint(1)\nPY\ncat > out.md <<'EOF'\n" + PROSE + "EOF",   # after a closed interpreter heredoc
+])
+def test_prose_in_a_heredoc_is_still_denylisted_and_the_block_points_at_the_write_tool(cmd, tmp_path):
+    # Stripping heredoc bodies was tried and reverted (hooks/NOTES.md): the scan covers the whole text.
+    env = {"JEV_GATE_URL": "http://localhost:1/x", "JEV_GATE_TIMEOUT": "1", "JEV_GATE_STRICT": "1"}
+    p = subprocess.run([str(HOOK)], input=json.dumps(bash(cmd)), capture_output=True, text=True,
+                       env={**os.environ, "JEV_GATE_LOG": str(tmp_path / "gate-test.jsonl"), **env}, timeout=60)
+    assert p.returncode == 2 and "Write tool" in p.stderr, cmd
+    rc, decision, _ = run_hook(bash(cmd), {"JEV_GATE_URL": "http://localhost:1/x"}, tmp_path)
+    assert rc == 0 and decision == "ask", cmd
+
+
+def test_block_message_without_a_heredoc_has_no_write_tool_hint(tmp_path):
+    p = subprocess.run([str(HOOK)], input=json.dumps(bash("git push -f origin main")), capture_output=True, text=True,
+                       env={**os.environ, "JEV_GATE_LOG": str(tmp_path / "gate-test.jsonl"), "JEV_GATE_STRICT": "1"}, timeout=60)
+    assert p.returncode == 2 and "Write tool" not in p.stderr
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat <<'EOF' | bash\nrm -rf ~/Documents\nEOF",
+    "python3 - <<'EOF'\nimport os; os.system('rm -rf ~/Documents')\nEOF",
+    "bash <<'EOF'\ngit push --force origin main\nEOF",
+    "cat > plan.md <<'EOF'\nharmless\nEOF\nrm -rf ~/Documents",
+    "cat > plan.md <<'EOF'\nunterminated body\nrm -rf ~/Documents",
+])
+def test_heredoc_bodies_that_execute_or_trail_a_heredoc_are_still_denylisted(cmd, tmp_path):
+    rc, decision, _ = run_hook(bash(cmd), {"JEV_GATE_URL": "http://localhost:1/x"}, tmp_path)
+    assert decision == "ask", cmd
+
+
+def test_override_marker_skips_the_model_layer(tmp_path):
+    # 17 headless velog publishes were denied on 2026-09-29 because only layer 1a honoured the marker.
+    env = {"JEV_GATE_URL": "http://localhost:1/x", "JEV_GATE_TIMEOUT": "1", "JEV_GATE_STRICT": "1"}
+    rc, decision, out = run_hook(bash("node publish.mjs draft.md  # jev-gate: override"), env, tmp_path)
+    assert rc == 0 and decision is None and out == ""
+    logged = json.loads((tmp_path / "gate-test.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert logged["layer"] == "jev" and "override" in logged["reason"]
+
+
+def _caution(conf, destr):
+    return {"risk": {"type": "choice", "choice": "caution", "confidence": conf, "probabilities": {}},
+            "destructive": {"type": "noul", "noul": destr}}
+
+
+@pytest.mark.parametrize("strict,destr,extra,rc_expected,decision_expected,logged", [
+    ("1", 0.76, {}, 2, "ask", "block"),   # git reset -q --hard, 2026-09-29: caution 0.90 / destructive 0.76
+    ("1", 0.36, {}, 0, "ask", "ask"),     # velog publish, 2026-09-29: caution 0.89 / destructive 0.28-0.36
+    ("0", 0.76, {}, 0, "ask", "ask"),     # non-strict never exits 2
+    ("1", 0.76, {"JEV_GATE_BLOCK_DESTRUCTIVE": "0.9"}, 0, "ask", "ask"),
+])
+def test_confident_caution_with_high_destructive_probability_blocks_in_strict_mode(
+        fake_server, tmp_path, strict, destr, extra, rc_expected, decision_expected, logged):
+    env = _model_env(fake_server, tmp_path, _caution(0.9, destr), extra={"JEV_GATE_STRICT": strict, **extra})
+    rc, decision, _ = run_hook(bash("git branch -D feature"), env, tmp_path)
+    assert (rc, decision) == (rc_expected, decision_expected)
+    last = json.loads((tmp_path / "gate-test.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert last["decision"] == logged and last["layer"] == "jev"
+
+
+def test_model_sees_a_short_command_untouched(fake_server, tmp_path):
+    env = _model_env(fake_server, tmp_path, _caution(0.5, 0.1))
+    cmd = "cat > plan.md <<'EOF'\nsome prose\nEOF"
+    run_hook(bash(cmd), env, tmp_path)
+    assert fake_server.requests[-1]["state"]["command"] == cmd
+
+
+def test_long_interpreter_heredocs_are_truncated_for_the_model_only(fake_server, tmp_path):
+    # A 13,000-char command took the model 5 s on 2026-09-29 (timeout 4 s -> no judgment at all).
+    env = _model_env(fake_server, tmp_path, _caution(0.5, 0.1))
+    cmd = "python3 - <<'EOF'\n" + ("y" * 12000) + "\nEOF"
+    run_hook(bash(cmd), env, tmp_path)
+    sent = fake_server.requests[-1]["state"]["command"]
+    assert sent.startswith("python3 - <<'EOF'") and sent.endswith("EOF") and "chars omitted" in sent
+    assert len(sent) <= 3000
+    logged = json.loads((tmp_path / "gate-test.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert len(logged["command"]) == len(cmd)   # the log keeps the full command
+
+
+# ---- heredoc bodies are always scanned ----------------------------------------------------------
+# 0.3.0 tried to strip prose heredoc bodies from the scan. Three adversarial review rounds produced
+# the inputs below, each of which let bash execute a body the stripper had hidden; the feature was
+# reverted and these stay as regression tests so no later "obvious" stripping can pass unnoticed.
+
+DEAD = {"JEV_GATE_URL": "http://localhost:1/x", "JEV_GATE_TIMEOUT": "1"}
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat x; bash <<'EOF'\nrm -rf ~/y\nEOF",                                  # interpreter after a benign cat
+    "cat x && bash <<'EOF'\nrm -rf ~/y\nEOF",
+    "bash <<'B' && cat <<'A'\nrm -rf ~/y\nB\nok\nA",                         # two heredocs, executing one first
+    "cat <<< x\nrm -rf ~/y\nx",                                              # here-string is not a heredoc
+    "echo \"a; cat <<x\"\nrm -rf ~/y\nx",                                    # opener inside a quoted string
+    "true # ;cat <<x\nrm -rf ~/y\nx",                                        # opener inside a comment
+    "cat <<'E'F\nx\nEF\nrm -rf ~/y\nE",                                      # delimiter awk would mis-read
+    "cat <<'a-b'\nrm -rf ~/y\na-b",
+    "git commit -F - <<EOF \\\n| sh\nrm -rf ~/y\nEOF",                       # continuation before a pipe
+    "cat <<EOF > >(bash)\nrm -rf ~/y\nEOF",                                  # process substitution
+    "tee >(bash) <<EOF\nrm -rf ~/y\nEOF",
+    "cat > x.sh <<'EOF'\nrm -rf ~/y\nEOF\nbash x.sh",                        # write a script, then run it
+    "cat > \"$(echo f)\" <<'EOF'\nrm -rf ~/y\nEOF",                          # command substitution in the target
+    "cat > f <<EOF | sh\nrm -rf ~/y\nEOF",
+    # second review round
+    "cat # <<EOF\nrm -rf ~/y\nEOF",                                          # `#` starts a comment, no heredoc
+    "cat \"a\\\" <<EOF \"x \"\n\" ; rm -rf ~/y ; echo \"\nEOF\n\"",         # escaped quote desyncs the reader
+    "cat '<<x' <<EOF\nhi\nEOF\nrm -rf ~/y\nx",                                # second << inside a quoted arg
+    "cat > a.md <<EOF\r\nEOF\r\nrm -rf ~/y\nEOF",                             # CR belongs to bash's delimiter
+    "echo \"start\ncat > a.md <<EOF\n\" ; rm -rf ~/y ; echo \"\nEOF\n\"",   # opener inside an open string
+    "bash <<'X'\ncat > a.md <<EOF\nX\nrm -rf ~/y\nEOF",                       # opener inside an outer heredoc
+    "python3 - <<'X'\ncat > a.md <<EOF\nX\nrm -rf ~/y\nEOF",
+    "cat() { bash; }\ncat > a.md <<EOF\nrm -rf ~/y\nEOF",                    # shadowed consumer
+    "alias cat=bash\ncat > a.md <<EOF\nrm -rf ~/y\nEOF",
+    "cat > run <<EOF\nrm -rf ~/y\nEOF\nbash run",                            # target without a document extension
+    "cat > x.SH <<EOF\nrm -rf ~/y\nEOF\nbash x.SH",
+    "cat > seed.sql <<EOF\nDROP TABLE users;\nEOF\npsql -f seed.sql",
+    "tee docs/x.md <<EOF\nrm -rf ~/y\nEOF",                                  # tee is not a stripped consumer
+    "cat > a.md > run <<EOF\nrm -rf ~/y\nEOF\nbash run",                     # two redirections
+    # third review round
+    "cat > plan.md <<EOF\n$(rm -rf ~/y)\nEOF",                               # unquoted delimiter: body is expanded
+    "cat <<< x\necho \"\nx\ncat > a.md <<EOF\n\" ; rm -rf ~/y ; echo \"\nEOF\n\"",
+    "bash <<'a-b'\na\ncat > n.md <<X\na-b\nrm -rf ~/y\nX",
+    "echo '\"'\"\ncat > a.md <<EOF\n\" ; rm -rf ~/y ; echo \"\nEOF\n\"",   # quote nesting, even counts
+    "echo `\ncat > a.md <<EOF\n` ; rm -rf ~/y ; echo `\nEOF\n`",            # backticks
+    "git config core.editor bash\ngit commit -e -F - <<EOF\nrm -rf ~/y\nEOF",
+    "cat > run.txt <<'EOF'\nrm -rf ~/y\nEOF\nbash run.txt",
+])
+def test_heredoc_bodies_are_never_hidden_from_the_scan(cmd, tmp_path):
+    rc, decision, _ = run_hook(bash(cmd), DEAD, tmp_path)
+    assert decision == "ask", cmd
+
+
+@pytest.mark.parametrize("cmd", ["git reset -q --soft HEAD~1", "git checkout -q main", "git clean -n", "git restore-x"])
+def test_widened_git_patterns_do_not_match_their_safe_neighbours(cmd, tmp_path):
+    rc, decision, _ = run_hook(bash(cmd), DEAD, tmp_path)
+    assert rc == 0 and decision is None, cmd
+
+
+def test_widened_git_pattern_blocks_with_exit_2_in_strict_mode(tmp_path):
+    rc, decision, _ = run_hook(bash("git fetch -q origin && git reset -q --hard origin/main"), {**DEAD, "JEV_GATE_STRICT": "1"}, tmp_path)
+    assert rc == 2 and decision == "ask"
+
+
+def test_override_marker_counts_only_on_the_last_line(tmp_path):
+    cmd = "cat > n.md <<'EOF'\n# jev-gate: override\nEOF\ngit push -f origin main"
+    rc, decision, _ = run_hook(bash(cmd), {**DEAD, "JEV_GATE_STRICT": "1"}, tmp_path)
+    assert rc == 2
+
+
+def test_non_strict_denylist_log_does_not_claim_an_override_that_is_not_there(tmp_path):
+    run_hook(bash("git push -f origin main"), DEAD, tmp_path)
+    logged = json.loads((tmp_path / "gate-test.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert "override" not in logged["reason"]
+
+
+@pytest.mark.parametrize("conf,destr,strict,rc_expected", [
+    (0.9, 0.7, "1", 2),     # boundary: destructive exactly at the block threshold
+    (0.9, 0.69, "1", 0),
+    (0.79, 0.95, "1", 0),   # confidence below the threshold never blocks, however destructive
+])
+def test_destructive_block_boundaries(fake_server, tmp_path, conf, destr, strict, rc_expected):
+    env = _model_env(fake_server, tmp_path, _caution(conf, destr), extra={"JEV_GATE_STRICT": strict})
+    rc, _, _ = run_hook(bash("git branch -D feature"), env, tmp_path)
+    assert rc == rc_expected
+
+
+def test_truncated_command_can_never_be_allowed_by_the_model(fake_server, tmp_path):
+    clear = {"risk": {"type": "choice", "choice": "clear", "confidence": 0.95, "probabilities": {}},
+             "destructive": {"type": "noul", "noul": 0.05}}
+    env = _model_env(fake_server, tmp_path, clear)
+    rc, decision, _ = run_hook(bash("cargo build --release"), env, tmp_path)
+    assert decision == "allow"
+    padded = "echo start\n" + ("# " + "x" * 78 + "\n") * 40 + "shred -u secrets.txt\n" + ("# " + "y" * 78 + "\n") * 20
+    rc, decision, _ = run_hook(bash(padded), env, tmp_path)
+    assert rc == 0 and decision is None
+    assert "chars omitted" in fake_server.requests[-1]["state"]["command"]
+
+
+def test_model_maxchars_env_is_respected(fake_server, tmp_path):
+    env = _model_env(fake_server, tmp_path, _caution(0.5, 0.1), extra={"JEV_GATE_MODEL_MAXCHARS": "1000"})
+    run_hook(bash("python3 - <<'EOF'\n" + ("z" * 1200) + "\nEOF"), env, tmp_path)
+    assert len(fake_server.requests[-1]["state"]["command"]) <= 1000

@@ -23,7 +23,7 @@ Claude Code의 권한 흐름이 내리고, 모델은 규칙이 판단하지 못�
 ```
 Bash 호출 ─▶ 1a 하드 거부 목록 (rm -r?f, push --force, reset --hard, DROP, sudo, publish, ~/.zshrc 쓰기 …) ─▶ ask (STRICT=1이면 exit 2 차단)
           ─▶ 1b 읽기 전용 빠른 경로 (ls/cat/grep/git status|log|diff …, 리다이렉션·$( )·xargs 없음) ─▶ allow, 모델 호출 없음, ~50 ms
-          ─▶ 2  winnow:e4b 판단 (risk choice + destructive noul, 타임아웃 4 s, ~750 ms)
+          ─▶ 2  winnow:e4b 판단 (risk choice + destructive noul, 타임아웃 6 s, 짧은 명령 ~250 ms·3,000자 상한)
                  caution ∧ p ≥ 0.8 ─▶ ask (이유에 확률 표기)
                  clear   ∧ p ≥ 0.8 ∧ destructive ≤ 0.2 ─▶ allow
                  그 외 · 서버 다운 · 타임아웃 · 파싱 실패 ─▶ 결정 없음 (평소 권한 흐름으로)
@@ -102,3 +102,33 @@ uv run --with pytest python -m pytest -q test_gate.py     # 33 passed (서버 �
 - 지연: 빠른 경로 ~50 ms, 모델 계층 ~750 ms(M4 Pro, Metal). 콜드 로드는 디스크에서 20 s, 파일 캐시가 있으면 1.6 s.
 - 메모리: winnow:e4b 로드 시 wired 메모리가 3 GB → 11 GB로 늘고 직후 압력 단계가 2(warn)까지 올라갔다가 수 분 뒤 1로 돌아왔다. 오케스트레이션 세션이 여럿 떠 있을 때는 올리지 말 것.
 - bypass 권한 모드: 공식 문서(code.claude.com/docs/en/hooks, "Hooks and permission modes")는 PreToolUse 훅이 모든 권한 모드에서 권한 검사 **전에** 실행되고, `permissionDecision: "deny"`와 exit 2는 bypassPermissions에서도 차단한다고 명시한다. `ask`가 bypass 모드에서 프롬프트를 띄우는지는 문서에 없다. 그래서 bypass 모드를 주로 쓰면 `JEV_GATE_STRICT=1`로 하드 거부 목록을 exit 2로 차단하게 두는 것이 문서가 보증하는 유일한 경로다. 모델 계층의 `ask`는 어느 모드에서든 "차단 보증"이 아니라 "의견"으로 취급할 것.
+
+## 2026-09-29 현장 하루치로 바꾼 것 (0.3.0)
+
+데이터: `~/.local/state/jev-gate/decisions.jsonl` 1,023건(09-28 19:32 → 09-29 14:16 KST), `stop-decisions.jsonl` 344건, 세션 기록 88개와 대조.
+
+| 계층 | 건수 | 실제로 일어난 일 |
+|---|---|---|
+| 규칙 allow(빠른 경로) | 106 | 모델 호출 없음 |
+| 규칙 block | 10 | 진짜 위험 2(`launchctl bootstrap`, `git checkout --`), 스크래치 `rm -rf` 4, **산문 오탐 3**(README·플랜·SVG 속 문구), localhost curl 오탐 1 |
+| 모델 ask | 59 | **대화형 bypass 41건 전부 실행됨**(가장 빠른 건 호출 1.8 s 뒤 완료 → 프롬프트 없음). **headless 17건 전부 거부**, 모두 auto-velog `publish.mjs` |
+| 모델 none | 847 | clear 확신 최대 0.77 → allow 0건(평가 예측 그대로) |
+| 타임아웃 | 44 (4.3%) | 12~13시 오케스트레이션 폭주(2시간에 Bash 800회)에 집중. 콜드 로드가 아니라 동시성 |
+| 정지 게이트 block | 3 / 344 | 전부 done ≥ 0.8 ∧ evidence ≤ 0.2. 2건은 에이전트가 실제 출력을 인용하게 만듦. 85%는 SubagentStop progress_only(헛검사 0.3 s) |
+| `decide` MCP 호출 | 0 | CLAUDE.md 규칙이 들어갔는데도 아무 세션도 쓰지 않음 |
+
+지연 재측정(winnow:e4b, 웜, 질문 2개): 짧은 명령 p50 255 ms · 3,000자 267 ms · 13,000자 5,014 ms · 동시 4요청 × 3.7k자 → 3.5~4.3 s.
+
+바꾼 것과 그 근거:
+
+1. **모델 계층 exit 2**: caution ≥ 0.8 ∧ destructive ≥ `JEV_GATE_BLOCK_DESTRUCTIVE`(0.7) → strict 차단. 하루 로그에서 이 조건에 드는 건 `git switch … && git reset -q --hard origin/main`(0.90/0.76)과 `git branch -D` 정리 루프(0.93/0.72) 둘뿐이라 마찰은 거의 없고, 0.6으로 내리면 `gh repo create`·설정 재작성이 걸린다.
+2. **모델 계층 override**: 마커가 있으면 모델을 호출하지 않고 `jev none`으로 로그. headless 발행 워커는 명령에 마커를 붙인다(플러그인 쪽 수정).
+3. **정규식**: `git reset -q --hard`가 통과한 것을 보고 reset·clean·checkout에 `([[:space:]]+-[^[:space:]]+)*`를 넣었다. `rm -r -f`처럼 플래그를 나눈 경우는 근거가 없어 그대로 둔다.
+4. **heredoc 본문 제외 — 시도 후 철회.** 산문 오탐 3건을 없애려고 `cat`·`git commit` 등이 파일로 받는 heredoc 본문을 스캔에서 빼는 awk를 넣었다(하루 로그의 파일 heredoc 125건 중 103건 해당). 독립 리뷰의 적대적 검토가 세 라운드에 걸쳐 18개 우회를 찾았다:
+   - 1차("줄 어딘가에 `cat … <<`"): `cat x; bash <<EOF`, 한 줄에 heredoc 둘, `<<<`, 따옴표·주석 속 `cat <<x`, `<<'E'F` 구분자 불일치, `\` 줄 연속 뒤 `| sh`, `>(bash)`.
+   - 2차("여는 줄 전체 매칭"): `cat # <<EOF`, `\"` 탈동기, `'<<x'` 속 두 번째 `<<`, CR 구분자, 앞줄의 열린 따옴표·바깥 heredoc·함수 가리기, 확장자 휴리스틱 회피.
+   - 3차(문서 확장자 허용 목록 + 모든 heredoc 추적 + 따옴표 홀짝 오염): 따옴표 없는 구분자의 `$( )` 확장, 패스스루 줄의 오염 미추적, 패스스루 구분자 접두 매칭, 따옴표 중첩(`'"'"`), 백틱, `core.editor bash` + `git commit -e`, `cat > run.txt` 뒤 `bash run.txt`.
+   라운드마다 구멍이 나오고 마지막 둘은 설계상 막을 수 없다(파일을 쓴 뒤 실행). 정규식으로 셸 어휘 상태를 반쯤 흉내 내는 것은 게이트 안에 둘 물건이 아니다. 철회하고, 차단 메시지에 "산문이면 Write 도구로" 안내를 넣었으며, 18개 입력은 `tests/`에 회귀 테스트로 남겼다(전부 `ask`여야 한다). 오탐 비용은 하루 3건 × 재시도 1턴이다.
+5. **모델 입력 3,000자 상한 + 타임아웃 6 s**: 하루 최장 명령 10건(10.5k~16.3k자)이 0.9~2.4 s로 들어온다. 로그는 원문.
+
+바꾸지 않은 것: SubagentStop 검사(헛검사가 많지만 오늘 유일하게 유용했던 서브에이전트 차단 1건이 여기서 나왔다), `decide` 도구(쓰이지 않아서 판단할 데이터가 없다).

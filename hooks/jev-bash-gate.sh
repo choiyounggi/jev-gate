@@ -3,18 +3,26 @@
 #
 # Layers, in order:
 #   1. deterministic rules (never delegated to a model)
+#        - hard denylist        -> ask (or block with exit 2 when JEV_GATE_STRICT=1); scans the whole text
 #        - read-only fast path  -> allow, no model call
-#        - hard denylist        -> ask (or block with exit 2 when JEV_GATE_STRICT=1)
 #   2. Jev/ollaya judgment (winnow:e4b by default) with typed questions
+#        - override marker present                                                -> no decision, model skipped
 #        - clear   with confidence >= JEV_GATE_THRESHOLD and low destructive prob -> allow
-#        - caution with confidence >= JEV_GATE_THRESHOLD                          -> ask
+#        - caution with confidence >= JEV_GATE_THRESHOLD
+#              and destructive >= JEV_GATE_BLOCK_DESTRUCTIVE                      -> block (exit 2) in strict mode
+#              otherwise                                                          -> ask
 #        - anything else, server down, timeout, bad JSON                          -> no decision
 #          (falls through to Claude Code's normal permission flow; never auto-allows on error)
+#
+# Field data (2026-09-29, 1,023 decisions): under bypassPermissions an "ask" from this hook runs the
+# command anyway in an interactive session and denies it in a headless one, so the model layer needs
+# its own exit-2 path for the irreversible cases and its own override path for the approved ones.
 #
 # Every decision is appended to $JEV_GATE_LOG (default ~/.local/state/jev-gate/decisions.jsonl)
 # so thresholds can be re-tuned against real traffic later.
 #
-# Env: JEV_GATE_DISABLE=1  JEV_GATE_URL  JEV_GATE_MODEL  JEV_GATE_THRESHOLD  JEV_GATE_TIMEOUT  JEV_GATE_STRICT  JEV_GATE_LOG
+# Env: JEV_GATE_DISABLE=1  JEV_GATE_URL  JEV_GATE_MODEL  JEV_GATE_THRESHOLD  JEV_GATE_BLOCK_DESTRUCTIVE
+#      JEV_GATE_MODEL_MAXCHARS  JEV_GATE_TIMEOUT  JEV_GATE_STRICT  JEV_GATE_LOG
 
 set -u
 
@@ -24,7 +32,9 @@ command -v jq >/dev/null 2>&1 || exit 0          # cannot parse input; never blo
 URL="${JEV_GATE_URL:-http://localhost:11435/v1/systemone}"
 MODEL="${JEV_GATE_MODEL:-$(cat "${XDG_CONFIG_HOME:-$HOME/.config}/jev-gate/model" 2>/dev/null || echo winnow:e4b)}"
 THRESHOLD="${JEV_GATE_THRESHOLD:-0.8}"
-TIMEOUT="${JEV_GATE_TIMEOUT:-4}"
+BLOCK_DESTR="${JEV_GATE_BLOCK_DESTRUCTIVE:-0.7}"   # 2026-09-29 log: only `git reset -q --hard` (0.76) and a `git branch -D` loop (0.72) sat above it
+MODEL_MAXCHARS="${JEV_GATE_MODEL_MAXCHARS:-3000}"  # 13,000-char commands took the model 5 s; 3,000 take ~0.3 s
+TIMEOUT="${JEV_GATE_TIMEOUT:-6}"                   # four concurrent 3.7k-char requests took 3.5–4.3 s each
 STRICT="${JEV_GATE_STRICT:-0}"
 LOG="${JEV_GATE_LOG:-$HOME/.local/state/jev-gate/decisions.jsonl}"
 
@@ -56,7 +66,8 @@ emit() {  # $1 decision (allow|ask), $2 reason
 DENY_PATTERNS=(
   'rm[[:space:]]+-[a-zA-Z]*[rR][a-zA-Z]*f|rm[[:space:]]+-[a-zA-Z]*f[a-zA-Z]*[rR]'
   'git[[:space:]]+push[[:space:]].*(--force|-f([[:space:]]|$)|\+[^[:space:]]+:)'
-  'git[[:space:]]+(reset[[:space:]]+--hard|clean[[:space:]]+-[a-zA-Z]*[fdx]|checkout[[:space:]]+--[[:space:]]|restore[[:space:]])'
+  # ([[:space:]]+-[^[:space:]]+)* lets short flags sit between the verb and the dangerous option (git reset -q --hard)
+  'git[[:space:]]+(reset([[:space:]]+-[^[:space:]]+)*[[:space:]]+--hard|clean([[:space:]]+-[^[:space:]]+)*[[:space:]]+-[a-zA-Z]*[fdxX]|checkout([[:space:]]+-[^[:space:]]+)*[[:space:]]+--[[:space:]]|restore[[:space:]])'
   '(DROP|TRUNCATE)[[:space:]]+(TABLE|DATABASE|SCHEMA)'
   'kubectl[[:space:]]+delete|helm[[:space:]]+(uninstall|delete)|terraform[[:space:]]+destroy'
   '(^|[[:space:]|;&])sudo[[:space:]]'
@@ -70,25 +81,31 @@ DENY_PATTERNS=(
 # A command ending in the override marker was explicitly approved by the user in conversation:
 # strict mode then asks instead of blocking, and the override is logged.
 OVERRIDE=0
-printf '%s' "$CMD" | grep -Eq -- '#[[:space:]]*jev-gate:[[:space:]]*override[[:space:]]*$' && OVERRIDE=1
+printf '%s' "$CMD" | tail -n 1 | grep -Eq -- '#[[:space:]]*jev-gate:[[:space:]]*override[[:space:]]*$' && OVERRIDE=1
 # The curl/wget rule is about outward network effects: skip it when every URL in the command is local.
 LOCAL_ONLY=0
 urls=$(printf '%s' "$CMD" | grep -oE 'https?://[^[:space:]"'"'"'<>]+' || true)
 if [ -n "$urls" ] && ! printf '%s\n' "$urls" | grep -Eqv '^https?://(localhost|127\.0\.0\.1|\[::1\])([:/]|$)'; then
   LOCAL_ONLY=1
 fi
+# The denylist scans the whole command text, heredoc bodies included. Prose in a heredoc that mentions
+# a dangerous command is therefore blocked too (3 of 1,023 commands on 2026-09-29). Stripping such
+# bodies was tried and reverted: three adversarial review rounds broke every regex-based reading of
+# shell quoting (see hooks/NOTES.md). The block message points at the Write tool instead.
+HEREDOC_HINT=""
+printf '%s' "$CMD" | grep -q '<<' && HEREDOC_HINT=" If the match is only prose inside a heredoc, write that file with the Write tool instead of a shell command."
 for pat in "${DENY_PATTERNS[@]}"; do
   case $pat in curl*) [ "$LOCAL_ONLY" = "1" ] && continue ;; esac
   if printf '%s' "$CMD" | grep -Eq -- "$pat"; then
     reason="deterministic rule matched: $pat"
     if [ "$STRICT" = "1" ] && [ "$OVERRIDE" != "1" ]; then
       log_decision rule block "$reason" ""
-      msg="$reason — blocked by jev-gate strict mode. If the user has explicitly approved this exact command, re-run it with the suffix '# jev-gate: override'."
+      msg="$reason — blocked by jev-gate strict mode. If the user has explicitly approved this exact command, re-run it with the suffix '# jev-gate: override'.$HEREDOC_HINT"
       emit ask "$msg"
       printf '%s\n' "$msg" >&2   # Claude Code shows stderr as the block message on exit 2
       exit 2
     fi
-    log_decision rule ask "$reason${OVERRIDE:+ (override marker present)}" ""
+    log_decision rule ask "$reason$([ "$OVERRIDE" = 1 ] && printf ' (override marker present)')" ""
     emit ask "$reason"; exit 0
   fi
 done
@@ -134,7 +151,24 @@ if ! printf '%s' "$CMD" | grep -Eq -- "$ESCAPE_TOKENS"; then
 fi
 
 # ---- layer 2: Jev / ollaya judgment ------------------------------------------------------------
-BODY=$(jq -cn --arg model "$MODEL" --arg cmd "$CMD" --arg intent "$DESC" --arg cwd "$CWD" '{
+# The user already approved this exact command in conversation: the model's opinion would only be
+# ignored (interactive bypass) or turned into a denial (headless). Log it and take no decision.
+if [ "$OVERRIDE" = "1" ]; then
+  log_decision jev none "override marker present: model layer skipped (user-approved in conversation)" ""
+  exit 0
+fi
+# The model input is capped so a long script cannot push the call past the timeout (which would mean
+# no judgment at all). The head and tail carry the verbs; the log keeps the whole command.
+MODEL_CMD=$CMD
+TRUNCATED=0
+if [ "${#MODEL_CMD}" -gt "$MODEL_MAXCHARS" ]; then
+  head_n=$(( MODEL_MAXCHARS * 2 / 3 )); tail_n=$(( MODEL_MAXCHARS / 4 ))
+  MODEL_CMD="${MODEL_CMD:0:$head_n}
+…[jev-gate: $(( ${#MODEL_CMD} - head_n - tail_n )) chars omitted]…
+${MODEL_CMD: -$tail_n}"
+  TRUNCATED=1   # the model did not see the middle, so its "clear" cannot become an allow below
+fi
+BODY=$(jq -cn --arg model "$MODEL" --arg cmd "$MODEL_CMD" --arg intent "$DESC" --arg cwd "$CWD" '{
   model: $model,
   state: {intent: $intent, command: $cmd, cwd: $cwd},
   questions: {
@@ -164,12 +198,20 @@ MODEL_JSON=$(jq -cn --arg c "$CHOICE" --argjson p "$CONF" --argjson d "$DESTR" -
 
 confident=$(jq -n --argjson p "$CONF" --argjson t "$THRESHOLD" '$p >= $t')
 low_destr=$(jq -n --argjson d "$DESTR" '$d <= 0.2')
-if [ "$CHOICE" = "clear" ] && [ "$confident" = "true" ] && [ "$low_destr" = "true" ]; then
+if [ "$CHOICE" = "clear" ] && [ "$confident" = "true" ] && [ "$low_destr" = "true" ] && [ "$TRUNCATED" = "0" ]; then
   reason=$(printf 'jev(%s): clear p=%.2f destructive=%.2f' "$MODEL" "$CONF" "$DESTR")
   log_decision jev allow "$reason" "$MODEL_JSON"
   emit allow "$reason"; exit 0
 fi
 if [ "$CHOICE" = "caution" ] && [ "$confident" = "true" ]; then
+  high_destr=$(jq -n --argjson d "$DESTR" --argjson t "$BLOCK_DESTR" '$d >= $t')
+  if [ "$STRICT" = "1" ] && [ "$high_destr" = "true" ]; then
+    reason=$(printf 'jev(%s): caution p=%.2f destructive=%.2f — blocked by jev-gate strict mode: likely irreversible loss of work or history. If the user has explicitly approved this exact command, re-run it with the suffix '"'"'# jev-gate: override'"'"'.' "$MODEL" "$CONF" "$DESTR")
+    log_decision jev block "$reason" "$MODEL_JSON"
+    emit ask "$reason"
+    printf '%s\n' "$reason" >&2
+    exit 2
+  fi
   reason=$(printf 'jev(%s): caution p=%.2f destructive=%.2f — review before running' "$MODEL" "$CONF" "$DESTR")
   log_decision jev ask "$reason" "$MODEL_JSON"
   emit ask "$reason"; exit 0
